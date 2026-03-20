@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>notfound.space — caustics</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body {
+      background: #000;
+      overflow: hidden;
+      cursor: none;
+    }
+    canvas {
+      display: block;
+      position: fixed;
+      top: 0;
+      left: 0;
+    }
+    .cursor-dot {
+      position: fixed;
+      width: 5px;
+      height: 5px;
+      background: rgba(200,220,255,0.2);
+      border-radius: 50%;
+      pointer-events: none;
+      z-index: 100;
+      transform: translate(-50%, -50%);
+      mix-blend-mode: screen;
+    }
+    .site-title {
+      position: fixed;
+      top: 28px;
+      left: 28px;
+      z-index: 10;
+      font-family: monospace;
+      font-size: 14pt;
+      color: rgba(255,255,255,1.0);
+      user-select: none;
+      pointer-events: none;
+      letter-spacing: 0.02em;
+    }
+    .info {
+      position: fixed;
+      bottom: 24px;
+      left: 28px;
+      z-index: 10;
+      font-family: 'Courier New', monospace;
+      font-size: 10px;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: rgba(255,255,255,0.05);
+      user-select: none;
+      pointer-events: none;
+      line-height: 1.9;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="c"></canvas>
+  <div class="cursor-dot" id="cursor"></div>
+  <div class="site-title">notfound.space</div>
+  <div class="info">
+    notfound.space — caustics<br>
+    move to disturb
+  </div>
+
+  <script>
+    const canvas = document.getElementById('c');
+    const gl = canvas.getContext('webgl') || canvas.getContext('experimental-webgl');
+    const cursorEl = document.getElementById('cursor');
+
+    if (!gl) {
+      document.body.innerHTML = '<p style="color:#333;font-family:monospace;padding:40px;">WebGL not supported</p>';
+      throw new Error('No WebGL');
+    }
+
+    let W, H;
+    let mouse = { x: 0.5, y: 0.5 };
+    let mouseVel = { x: 0, y: 0 };
+    let mouseActiveSmooth = 0;
+    let lastMoveTime = -10;
+
+    const MAX_RIPPLES = 32;
+    let ripples = [];
+
+    function resize() {
+      W = canvas.width = window.innerWidth;
+      H = canvas.height = window.innerHeight;
+      gl.viewport(0, 0, W, H);
+    }
+
+    const vsSource = `
+      attribute vec2 a_position;
+      void main() {
+        gl_Position = vec4(a_position, 0.0, 1.0);
+      }
+    `;
+
+    const fsSource = `
+      precision highp float;
+
+      uniform vec2 u_resolution;
+      uniform float u_time;
+      uniform vec2 u_mouse;
+      uniform vec2 u_mouseVel;
+      uniform float u_mouseActive;
+
+      uniform vec2 u_ripplePos[${MAX_RIPPLES}];
+      uniform float u_rippleTime[${MAX_RIPPLES}];
+      uniform float u_rippleStr[${MAX_RIPPLES}];
+      uniform int u_rippleCount;
+
+      mat2 rot(float a) {
+        float c = cos(a), s = sin(a);
+        return mat2(c, -s, s, c);
+      }
+
+      vec2 hash2(vec2 p) {
+        p = vec2(dot(p, vec2(127.1, 311.7)), dot(p, vec2(269.5, 183.3)));
+        return -1.0 + 2.0 * fract(sin(p) * 43758.5453123);
+      }
+
+      float hash1(vec2 p) {
+        return fract(sin(dot(p, vec2(12.9898, 78.233))) * 43758.5453);
+      }
+
+      vec2 hashPoint(vec2 cell) {
+        float x = fract(sin(dot(cell, vec2(127.1, 311.7))) * 43758.5453);
+        float y = fract(sin(dot(cell, vec2(269.5, 183.3))) * 43758.5453);
+        return vec2(x, y);
+      }
+
+      float gnoise(vec2 p) {
+        vec2 i = floor(p);
+        vec2 f = fract(p);
+        vec2 u = f * f * f * (f * (f * 6.0 - 15.0) + 10.0);
+        return mix(
+          mix(dot(hash2(i), f),
+              dot(hash2(i + vec2(1.0, 0.0)), f - vec2(1.0, 0.0)), u.x),
+          mix(dot(hash2(i + vec2(0.0, 1.0)), f - vec2(0.0, 1.0)),
+              dot(hash2(i + vec2(1.0, 1.0)), f - vec2(1.0, 1.0)), u.x),
+          u.y
+        );
+      }
+
+      float fbm(vec2 p) {
+        float v = 0.0, a = 0.6;
+        for (int i = 0; i < 4; i++) {
+          v += a * gnoise(p);
+          p = rot(0.37) * p * 2.0;
+          a *= 0.45;
+        }
+        return v;
+      }
+
+      vec2 toWorld(vec2 uv) {
+        float aspect = u_resolution.x / u_resolution.y;
+        return vec2((uv.x - 0.5) * aspect, uv.y - 0.5) * 6.0;
+      }
+
+      float disturbanceEnergy(vec2 p) {
+        float energy = 0.0;
+        vec2 mp = toWorld(u_mouse);
+
+        if (u_mouseActive > 0.01) {
+          float d = length(p - mp);
+          energy += exp(-d * 0.7) * u_mouseActive * 1.2;
+        }
+
+        for (int i = 0; i < ${MAX_RIPPLES}; i++) {
+          if (i >= u_rippleCount) break;
+          vec2 rp = toWorld(u_ripplePos[i]);
+          float age = u_time - u_rippleTime[i];
+          if (age < 0.0 || age > 6.0) continue;
+          float d = length(p - rp);
+          float decay = exp(-age * age * 0.15) * u_rippleStr[i];
+          float spread = age * 1.2;
+          energy += exp(-abs(d - spread) * 0.8) * decay * 0.7;
+          energy += exp(-d * 1.0) * decay * 0.4;
+        }
+
+        return clamp(energy, 0.0, 1.0);
+      }
+
+      float surface(vec2 p) {
+        float t = u_time * 0.06;
+
+        float h = 0.0;
+        h += sin(p.x * 0.5 + t * 0.8) * cos(p.y * 0.4 - t * 0.5) * 0.8;
+        h += sin(p.x * 0.8 + p.y * 0.6 - t * 0.6) * 0.5;
+        h += sin(p.y * 0.9 + t * 0.35 + p.x * 0.25) * 0.35;
+        h += fbm(p * 0.4 + t * 0.12) * 0.7;
+        h += gnoise(p * 1.0 + vec2(t * 0.15, -t * 0.12)) * 0.2;
+
+        vec2 mp = toWorld(u_mouse);
+        if (u_mouseActive > 0.01) {
+          float d = length(p - mp);
+          float wave = sin(d * 4.0 - u_time * 3.0) * exp(-d * 1.0);
+          h += wave * 0.8 * u_mouseActive;
+
+          float velMag = length(u_mouseVel);
+          if (velMag > 0.001) {
+            vec2 vd = normalize(u_mouseVel);
+            float wake = max(dot(normalize(p - mp + 0.001), vd), 0.0);
+            h += wake * sin(d * 6.0 - u_time * 4.0) * exp(-d * 1.3) * velMag * 3.0;
+          }
+        }
+
+        for (int i = 0; i < ${MAX_RIPPLES}; i++) {
+          if (i >= u_rippleCount) break;
+          vec2 rp = toWorld(u_ripplePos[i]);
+          float age = u_time - u_rippleTime[i];
+          if (age < 0.0 || age > 6.0) continue;
+          float d = length(p - rp);
+          float decay = exp(-age * age * 0.15) * u_rippleStr[i];
+          float spread = age * 0.9;
+          float ring = sin((d - spread) * 6.0) * exp(-(d - spread) * (d - spread) * 1.2);
+          h += ring * decay * 0.5;
+        }
+
+        return h;
+      }
+
+      float contourDist(vec2 p, float freq) {
+        float h = surface(p);
+        float contour = abs(fract(h * freq + 0.5) - 0.5) / freq;
+        float e = 0.015;
+        float hx = surface(p + vec2(e, 0.0));
+        float hy = surface(p + vec2(0.0, e));
+        float gradMag = length(vec2(hx - h, hy - h)) / e;
+        return contour / max(gradMag, 0.001);
+      }
+
+      float dissolveMask(vec2 p, float energy) {
+        float n1 = gnoise(p * 25.0 + u_time * 0.1) * 0.5 + 0.5;
+        float n2 = gnoise(p * 8.0 - u_time * 0.05) * 0.5 + 0.5;
+        float noiseVal = n1 * 0.7 + n2 * 0.3;
+        // sqrt curve: half dots gone at energy 0.75
+        float threshold = sqrt(1.0 - energy);
+        float mask = smoothstep(threshold - 0.05, threshold + 0.05, noiseVal);
+        return mask;
+      }
+
+      // Chromatic dots — OPTIMIZED: uses pixel's lineDist instead of
+      // recalculating contourDist per sparkle (saves ~27 surface() calls)
+      vec3 chromaticDots(vec2 p, float lineDist, float energy) {
+        vec3 caTotal = vec3(0.0);
+        float cellSize = 0.18;
+        vec2 grid = p / cellSize;
+        vec2 cell = floor(grid);
+
+        // Pixel near a line? (broad zone for dot scatter)
+        float pixelNearLine = smoothstep(0.1, 0.01, lineDist);
+        if (pixelNearLine < 0.001) return caTotal; // early exit — far from any line
+
+        for (int x = -1; x <= 1; x++) {
+          for (int y = -1; y <= 1; y++) {
+            vec2 neighbor = cell + vec2(float(x), float(y));
+            vec2 pt = hashPoint(neighbor);
+            vec2 dotCenter = (neighbor + pt) * cellSize;
+
+            float d = length(p - dotCenter);
+            // Skip dots too far from this pixel
+            if (d > 0.05) continue;
+
+            // Use a cheap random offset from line center for scatter
+            float scatterDist = hash1(neighbor + 400.0) * 0.06;
+            float nearLine = smoothstep(0.005, 0.015, scatterDist)
+                           * (1.0 - smoothstep(0.04, 0.1, scatterDist));
+
+            // Brief flash
+            float phase = hash1(neighbor + 50.0) * 6.28;
+            float speed = 4.5 + hash1(neighbor + 100.0) * 8.0;
+            float offset = hash1(neighbor + 150.0) * 100.0;
+            float t = mod(u_time * speed + phase + offset, 6.28);
+            float pulseWidth = 0.2 + hash1(neighbor + 200.0) * 0.25;
+            float pulse = exp(-t * t / (pulseWidth * pulseWidth));
+
+            // Chromatic split direction
+            float caAngle = hash1(neighbor + 300.0) * 6.28;
+            vec2 caDir = vec2(cos(caAngle), sin(caAngle));
+            float caSpread = 0.012 + hash1(neighbor + 350.0) * 0.015;
+
+            float dotSize = 0.008 + hash1(neighbor + 250.0) * 0.01;
+            float dotSizeSq = dotSize * dotSize;
+
+            vec2 rPos = dotCenter + caDir * caSpread;
+            vec2 gPos = dotCenter;
+            vec2 bPos = dotCenter - caDir * caSpread;
+
+            float rGlow = exp(-dot(p - rPos, p - rPos) / dotSizeSq);
+            float gGlow = exp(-dot(p - gPos, p - gPos) / dotSizeSq);
+            float bGlow = exp(-dot(p - bPos, p - bPos) / dotSizeSq);
+
+            caTotal += vec3(rGlow, gGlow, bGlow) * pulse * nearLine * pixelNearLine;
+          }
+        }
+
+        float caEnergy = energy * energy;
+        caTotal *= smoothstep(0.02, 0.25, caEnergy);
+
+        return clamp(caTotal, 0.0, 1.0);
+      }
+
+      void main() {
+        vec2 uv = gl_FragCoord.xy / u_resolution;
+        vec2 p = toWorld(uv);
+
+        float energy = disturbanceEnergy(p);
+
+        float lineFreq = 3.5;
+        float lineWidth = 0.012;
+
+        // Contour line — computed once
+        float dist = contourDist(p, lineFreq);
+        float line = 1.0 - smoothstep(0.0, lineWidth, dist);
+        line = pow(line, 1.5);
+
+        float brightVar = gnoise(p * 3.0 + u_time * 0.2);
+        brightVar = smoothstep(0.0, 0.8, brightVar * 0.5 + 0.5);
+        line *= mix(0.5, 1.0, brightVar);
+
+        // Dissolve
+        float mask = dissolveMask(p, energy);
+        line *= mask;
+
+        float baseBright = 0.15;
+        float peakBright = 1.4;
+        float brightness = mix(baseBright, peakBright, energy);
+        float litLine = line * brightness;
+        litLine = clamp(litLine, 0.0, 1.0);
+
+        // Chromatic dots — pass precomputed dist
+        vec3 ca = chromaticDots(p, dist, energy) * 1.5;
+
+        vec3 lineColor = vec3(0.85, 0.92, 1.0) * litLine;
+        vec3 col = lineColor + ca;
+
+        float vig = 1.0 - length(uv - 0.5) * 0.35;
+        col *= vig;
+
+        col = clamp(col, 0.0, 1.0);
+        gl_FragColor = vec4(col, 1.0);
+      }
+    `;
+
+    function compile(src, type) {
+      const s = gl.createShader(type);
+      gl.shaderSource(s, src);
+      gl.compileShader(s);
+      if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) {
+        console.error('Shader error:', gl.getShaderInfoLog(s));
+        return null;
+      }
+      return s;
+    }
+
+    const vs = compile(vsSource, gl.VERTEX_SHADER);
+    const fs = compile(fsSource, gl.FRAGMENT_SHADER);
+    const prog = gl.createProgram();
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+      console.error('Link error:', gl.getProgramInfoLog(prog));
+    }
+    gl.useProgram(prog);
+
+    const buf = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+    gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 1,-1, -1,1, 1,1]), gl.STATIC_DRAW);
+    const aPos = gl.getAttribLocation(prog, 'a_position');
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 0, 0);
+
+    const u = {
+      res: gl.getUniformLocation(prog, 'u_resolution'),
+      time: gl.getUniformLocation(prog, 'u_time'),
+      mouse: gl.getUniformLocation(prog, 'u_mouse'),
+      mouseVel: gl.getUniformLocation(prog, 'u_mouseVel'),
+      mouseActive: gl.getUniformLocation(prog, 'u_mouseActive'),
+      rippleCount: gl.getUniformLocation(prog, 'u_rippleCount'),
+      ripplePos: [], rippleTime: [], rippleStr: [],
+    };
+    for (let i = 0; i < MAX_RIPPLES; i++) {
+      u.ripplePos.push(gl.getUniformLocation(prog, `u_ripplePos[${i}]`));
+      u.rippleTime.push(gl.getUniformLocation(prog, `u_rippleTime[${i}]`));
+      u.rippleStr.push(gl.getUniformLocation(prog, `u_rippleStr[${i}]`));
+    }
+
+    const t0 = performance.now() / 1000;
+    let rippleAccum = 0;
+
+    function frame() {
+      const t = performance.now() / 1000 - t0;
+      gl.uniform2f(u.res, W, H);
+      gl.uniform1f(u.time, t);
+
+      const timeSinceMove = t - lastMoveTime;
+      const target = timeSinceMove < 0.15 ? 1.0 : 0.0;
+      const decayRate = target < 0.5 ? 0.04 + (1.0 - mouseActiveSmooth) * 0.08 : 0.068;
+      mouseActiveSmooth += (target - mouseActiveSmooth) * decayRate;
+      const velDecay = 0.9 + mouseActiveSmooth * 0.05;
+      mouseVel.x *= velDecay;
+      mouseVel.y *= velDecay;
+
+      gl.uniform2f(u.mouse, mouse.x, mouse.y);
+      gl.uniform2f(u.mouseVel, mouseVel.x, mouseVel.y);
+      gl.uniform1f(u.mouseActive, mouseActiveSmooth);
+
+      ripples = ripples.filter(r => (t - r.time) < 6.15);
+      const count = Math.min(ripples.length, MAX_RIPPLES);
+      gl.uniform1i(u.rippleCount, count);
+      for (let i = 0; i < count; i++) {
+        gl.uniform2f(u.ripplePos[i], ripples[i].x, ripples[i].y);
+        gl.uniform1f(u.rippleTime[i], ripples[i].time);
+        gl.uniform1f(u.rippleStr[i], ripples[i].str);
+      }
+
+      gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+      requestAnimationFrame(frame);
+    }
+
+    function onMove(nx, ny) {
+      const dx = nx - mouse.x;
+      const dy = ny - mouse.y;
+      mouseVel.x += dx * 2.0;
+      mouseVel.y += dy * 2.0;
+      mouse.x = nx;
+      mouse.y = ny;
+      const t = performance.now() / 1000 - t0;
+      lastMoveTime = t;
+      const vel = Math.sqrt(mouseVel.x * mouseVel.x + mouseVel.y * mouseVel.y);
+      rippleAccum += vel;
+      if (rippleAccum > 0.008 && ripples.length < MAX_RIPPLES) {
+        ripples.push({ x: nx, y: ny, time: t, str: Math.min(vel * 4.0, 1.8) });
+        rippleAccum = 0;
+      }
+    }
+
+    window.addEventListener('mousemove', (e) => {
+      onMove(e.clientX / W, 1.0 - e.clientY / H);
+      cursorEl.style.left = e.clientX + 'px';
+      cursorEl.style.top = e.clientY + 'px';
+    });
+    window.addEventListener('mouseleave', () => { cursorEl.style.display = 'none'; });
+    window.addEventListener('mouseenter', () => { cursorEl.style.display = 'block'; });
+    window.addEventListener('touchmove', (e) => {
+      e.preventDefault();
+      const touch = e.touches[0];
+      onMove(touch.clientX / W, 1.0 - touch.clientY / H);
+    }, { passive: false });
+    window.addEventListener('touchstart', (e) => {
+      const touch = e.touches[0];
+      mouse.x = touch.clientX / W;
+      mouse.y = 1.0 - touch.clientY / H;
+      const t = performance.now() / 1000 - t0;
+      lastMoveTime = t;
+      ripples.push({ x: mouse.x, y: mouse.y, time: t, str: 1.2 });
+    });
+    window.addEventListener('resize', resize);
+
+    resize();
+    frame();
+  </script>
+</body>
+</html>
