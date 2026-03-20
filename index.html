@@ -9,24 +9,13 @@
     body {
       background: #000;
       overflow: hidden;
-      cursor: none;
+      cursor: crosshair;
     }
     canvas {
       display: block;
       position: fixed;
       top: 0;
       left: 0;
-    }
-    .cursor-dot {
-      position: fixed;
-      width: 5px;
-      height: 5px;
-      background: rgba(200,220,255,0.2);
-      border-radius: 50%;
-      pointer-events: none;
-      z-index: 100;
-      transform: translate(-50%, -50%);
-      mix-blend-mode: screen;
     }
     .site-title {
       position: fixed;
@@ -58,17 +47,15 @@
 </head>
 <body>
   <canvas id="c"></canvas>
-  <div class="cursor-dot" id="cursor"></div>
   <div class="site-title">notfound.space</div>
   <div class="info">
     notfound.space — caustics<br>
-    move to disturb
+    click &amp; drag to disturb
   </div>
 
   <script>
     const canvas = document.getElementById('c');
     const gl = canvas.getContext('webgl', { antialias: true }) || canvas.getContext('experimental-webgl', { antialias: true });
-    const cursorEl = document.getElementById('cursor');
     const ext = gl.getExtension('OES_standard_derivatives');
 
     if (!gl) {
@@ -80,7 +67,12 @@
     let mouse = { x: 0.5, y: 0.5 };
     let mouseVel = { x: 0, y: 0 };
     let mouseActiveSmooth = 0;
-    let lastMoveTime = -10;
+    let lastActiveTime = -10;
+
+    let isPressed = false;
+    let pressStartTime = 0;
+    let pressEnergy = 0;
+    let dragActive = false;
 
     const MAX_RIPPLES = 32;
     let ripples = [];
@@ -224,11 +216,9 @@
         return h;
       }
 
-      // Returns raw contour value and gradient-corrected distance
-      float contourDist(vec2 p, float freq, out float rawContour) {
+      float contourDist(vec2 p, float freq) {
         float h = surface(p);
-        rawContour = fract(h * freq + 0.5);
-        float contour = abs(rawContour - 0.5) / freq;
+        float contour = abs(fract(h * freq + 0.5) - 0.5) / freq;
         float e = 0.015;
         float hx = surface(p + vec2(e, 0.0));
         float hy = surface(p + vec2(0.0, e));
@@ -236,13 +226,45 @@
         return contour / max(gradMag, 0.001);
       }
 
-      float dissolveMask(vec2 p, float energy) {
-        float n1 = gnoise(p * 25.0 + u_time * 0.1) * 0.5 + 0.5;
-        float n2 = gnoise(p * 8.0 - u_time * 0.05) * 0.5 + 0.5;
-        float noiseVal = n1 * 0.7 + n2 * 0.3;
-        float threshold = sqrt(1.0 - energy);
-        float mask = smoothstep(threshold - 0.05, threshold + 0.05, noiseVal);
-        return mask;
+      // Dot pattern along contour — varied sizes, soft gaussian
+      float dotContour(vec2 p, float lineDist, float energy) {
+        // Only compute near contour lines — wider zone for big dots
+        if (lineDist > 0.06) return 0.0;
+
+        // Proximity to line — soft falloff
+        float lineProximity = exp(-lineDist * lineDist / 0.0003);
+
+        // Two scales of noise for dot positions — creates varied clustering
+        float n1 = gnoise(p * 40.0 + u_time * 0.05);  // fine dots
+        float n2 = gnoise(p * 15.0 - u_time * 0.03);   // medium clusters
+        float n3 = gnoise(p * 6.0 + u_time * 0.02);    // large variation
+
+        // Combined noise → dot intensity at this point
+        float dotNoise = n1 * 0.5 + n2 * 0.3 + n3 * 0.2;
+        dotNoise = dotNoise * 0.5 + 0.5; // normalize to 0-1
+
+        // Soft dot shape — varied sizes via noise
+        // n3 controls local dot "size" — some areas have bigger dots, some smaller
+        float dotSizeVar = 0.3 + (n3 * 0.5 + 0.5) * 0.7; // 0.3 to 1.0
+        float dotShape = smoothstep(0.25 * dotSizeVar, 0.65 * dotSizeVar, dotNoise);
+
+        // Overall dot brightness — soft gaussian modulation
+        float brightness = dotShape * lineProximity;
+
+        // Dissolve: earlier threshold + longer tail
+        // Dots start disappearing at energy ~0.85
+        float dissolveNoise = gnoise(p * 20.0 + u_time * 0.08) * 0.5 + 0.5;
+        float dissolveNoise2 = gnoise(p * 7.0 - u_time * 0.04) * 0.5 + 0.5;
+        float dissolveVal = dissolveNoise * 0.65 + dissolveNoise2 * 0.35;
+
+        // pow(1-energy, 0.6) = earlier start, softer tail
+        float threshold = pow(1.0 - energy, 0.6);
+        // Wider smoothstep = more gradual fade per dot (lingering)
+        float dissolveMask = smoothstep(threshold - 0.08, threshold + 0.12, dissolveVal);
+
+        brightness *= dissolveMask;
+
+        return clamp(brightness, 0.0, 1.0);
       }
 
       vec3 chromaticDots(vec2 p, float lineDist, float energy) {
@@ -258,7 +280,6 @@
           for (int y = -1; y <= 1; y++) {
             vec2 neighbor = cell + vec2(float(x), float(y));
 
-            // 10% reduction — skip 10% of cells
             float cellChance = hash1(neighbor + 500.0);
             if (cellChance > 0.90) continue;
 
@@ -312,38 +333,32 @@
 
         float lineFreq = 3.5;
 
-        // Contour line with anti-aliasing
-        float rawContour;
-        float dist = contourDist(p, lineFreq, rawContour);
+        // Contour distance
+        float dist = contourDist(p, lineFreq);
 
-        // fwidth gives the rate of change per pixel — perfect AA filter
-        float fw = fwidth(dist);
-        // Adaptive line width: base + screen-space AA padding
-        float lineWidth = 0.010 + fw * 1.5;
+        // Dot-based contour rendering
+        float dots = dotContour(p, dist, energy);
 
-        float line = 1.0 - smoothstep(0.0, lineWidth, dist);
-        line = pow(line, 1.3);
-
+        // Brightness variation
         float brightVar = gnoise(p * 3.0 + u_time * 0.2);
         brightVar = smoothstep(0.0, 0.8, brightVar * 0.5 + 0.5);
-        line *= mix(0.5, 1.0, brightVar);
+        dots *= mix(0.6, 1.0, brightVar);
 
-        // Dissolve
-        float mask = dissolveMask(p, energy);
-        line *= mask;
-
+        // Brightness by disturbance
         float baseBright = 0.15;
         float peakBright = 1.4;
         float brightness = mix(baseBright, peakBright, energy);
-        float litLine = line * brightness;
-        litLine = clamp(litLine, 0.0, 1.0);
+        float litDots = dots * brightness;
+        litDots = clamp(litDots, 0.0, 1.0);
 
         // Chromatic dots
         vec3 ca = chromaticDots(p, dist, energy) * 1.5;
 
-        vec3 lineColor = vec3(0.85, 0.92, 1.0) * litLine;
-        vec3 col = lineColor + ca;
+        // Cool blue-white
+        vec3 col = vec3(0.85, 0.92, 1.0) * litDots;
+        col += ca;
 
+        // Vignette
         float vig = 1.0 - length(uv - 0.5) * 0.35;
         col *= vig;
 
@@ -399,16 +414,29 @@
     const t0 = performance.now() / 1000;
     let rippleAccum = 0;
 
+    function now() { return performance.now() / 1000 - t0; }
+
     function frame() {
-      const t = performance.now() / 1000 - t0;
+      const t = now();
       gl.uniform2f(u.res, W, H);
       gl.uniform1f(u.time, t);
 
-      const timeSinceMove = t - lastMoveTime;
-      const target = timeSinceMove < 0.15 ? 1.0 : 0.0;
-      const decayRate = target < 0.5 ? 0.04 + (1.0 - mouseActiveSmooth) * 0.08 : 0.068;
-      mouseActiveSmooth += (target - mouseActiveSmooth) * decayRate;
-      const velDecay = 0.9 + mouseActiveSmooth * 0.05;
+      if (isPressed) {
+        const holdDuration = t - pressStartTime;
+        pressEnergy = Math.min(1.0, holdDuration / 2.0);
+        lastActiveTime = t;
+      }
+
+      const targetActive = isPressed ? pressEnergy : 0.0;
+
+      if (isPressed) {
+        mouseActiveSmooth += (targetActive - mouseActiveSmooth) * 0.12;
+      } else {
+        const decayRate = 0.04 + (1.0 - mouseActiveSmooth) * 0.08;
+        mouseActiveSmooth += (targetActive - mouseActiveSmooth) * decayRate;
+      }
+
+      const velDecay = isPressed ? 0.95 : (0.9 + mouseActiveSmooth * 0.05);
       mouseVel.x *= velDecay;
       mouseVel.y *= velDecay;
 
@@ -425,47 +453,87 @@
         gl.uniform1f(u.rippleStr[i], ripples[i].str);
       }
 
+      if (isPressed && pressEnergy > 0.05) {
+        rippleAccum += 0.016;
+        if (rippleAccum > 0.08 && ripples.length < MAX_RIPPLES) {
+          ripples.push({ x: mouse.x, y: mouse.y, time: t, str: pressEnergy * 0.8 });
+          rippleAccum = 0;
+        }
+      }
+
       gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
       requestAnimationFrame(frame);
     }
 
-    function onMove(nx, ny) {
-      const dx = nx - mouse.x;
-      const dy = ny - mouse.y;
-      mouseVel.x += dx * 2.0;
-      mouseVel.y += dy * 2.0;
+    function getCoords(e) {
+      const cx = e.clientX !== undefined ? e.clientX : e.touches[0].clientX;
+      const cy = e.clientY !== undefined ? e.clientY : e.touches[0].clientY;
+      return { nx: cx / W, ny: 1.0 - cy / H };
+    }
+
+    function onPressStart(e) {
+      e.preventDefault();
+      isPressed = true;
+      dragActive = false;
+      const t = now();
+      pressStartTime = t;
+      pressEnergy = 0;
+      const { nx, ny } = getCoords(e);
       mouse.x = nx;
       mouse.y = ny;
-      const t = performance.now() / 1000 - t0;
-      lastMoveTime = t;
+      mouseVel.x = 0;
+      mouseVel.y = 0;
+      ripples.push({ x: nx, y: ny, time: t, str: 0.3 });
+    }
+
+    function onPressMove(e) {
+      if (!isPressed) return;
+      e.preventDefault();
+      dragActive = true;
+      const { nx, ny } = getCoords(e);
+      const dx = nx - mouse.x;
+      const dy = ny - mouse.y;
+      mouseVel.x += dx * 2.5;
+      mouseVel.y += dy * 2.5;
+      mouse.x = nx;
+      mouse.y = ny;
+      const t = now();
+      lastActiveTime = t;
       const vel = Math.sqrt(mouseVel.x * mouseVel.x + mouseVel.y * mouseVel.y);
-      rippleAccum += vel;
-      if (rippleAccum > 0.008 && ripples.length < MAX_RIPPLES) {
-        ripples.push({ x: nx, y: ny, time: t, str: Math.min(vel * 4.0, 1.8) });
-        rippleAccum = 0;
+      if (vel > 0.005 && ripples.length < MAX_RIPPLES) {
+        ripples.push({ x: nx, y: ny, time: t, str: Math.min(vel * 3.0 + pressEnergy * 0.5, 1.8) });
       }
     }
 
-    window.addEventListener('mousemove', (e) => {
-      onMove(e.clientX / W, 1.0 - e.clientY / H);
-      cursorEl.style.left = e.clientX + 'px';
-      cursorEl.style.top = e.clientY + 'px';
-    });
-    window.addEventListener('mouseleave', () => { cursorEl.style.display = 'none'; });
-    window.addEventListener('mouseenter', () => { cursorEl.style.display = 'block'; });
-    window.addEventListener('touchmove', (e) => {
+    function onPressEnd(e) {
+      if (!isPressed) return;
       e.preventDefault();
-      const touch = e.touches[0];
-      onMove(touch.clientX / W, 1.0 - touch.clientY / H);
-    }, { passive: false });
-    window.addEventListener('touchstart', (e) => {
-      const touch = e.touches[0];
-      mouse.x = touch.clientX / W;
-      mouse.y = 1.0 - touch.clientY / H;
-      const t = performance.now() / 1000 - t0;
-      lastMoveTime = t;
-      ripples.push({ x: mouse.x, y: mouse.y, time: t, str: 1.2 });
-    });
+      const t = now();
+      const burstStr = Math.min(pressEnergy * 1.5 + 0.3, 2.0);
+      const burstCount = Math.floor(2 + pressEnergy * 4);
+      for (let i = 0; i < burstCount && ripples.length < MAX_RIPPLES; i++) {
+        const angle = Math.random() * Math.PI * 2;
+        const spread = Math.random() * 0.02 * pressEnergy;
+        ripples.push({
+          x: mouse.x + Math.cos(angle) * spread,
+          y: mouse.y + Math.sin(angle) * spread,
+          time: t + i * 0.02,
+          str: burstStr * (0.7 + Math.random() * 0.3)
+        });
+      }
+      lastActiveTime = t;
+      isPressed = false;
+      dragActive = false;
+      pressEnergy = 0;
+    }
+
+    canvas.addEventListener('mousedown', onPressStart);
+    window.addEventListener('mousemove', (e) => { if (isPressed) onPressMove(e); });
+    window.addEventListener('mouseup', onPressEnd);
+    canvas.addEventListener('touchstart', onPressStart, { passive: false });
+    window.addEventListener('touchmove', (e) => { if (isPressed) onPressMove(e); }, { passive: false });
+    window.addEventListener('touchend', onPressEnd, { passive: false });
+    window.addEventListener('touchcancel', onPressEnd, { passive: false });
     window.addEventListener('resize', resize);
 
     resize();
